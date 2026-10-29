@@ -1,0 +1,25 @@
+[package]
+name = "cbl-qyl-convert"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bincode = { version = "=2.0.0-rc.3", features = ["serde"] }
+encoding_rs = "=0.8.35"
+flate2 = "=1.1.9"
+gpui-kit = "=0.8.0"
+rfd = "=0.15.4"
+serde = { version = "=1.0.228", features = ["derive"] }
+zstd = "=0.13.3"
+
+[dev-dependencies]
+gpui-kit = { version = "=0.8.0", features = ["test-support"] }
+
+[target.'cfg(windows)'.build-dependencies]
+embed-resource = "=3.0.12"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
