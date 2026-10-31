@@ -1,6 +1,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod cbl;
+mod fen;
 mod qy;
 mod selection;
 
@@ -14,6 +15,7 @@ use gpui_kit::component::*;
 use gpui_kit::*;
 use qy::{Game, Library};
 use selection::Selection;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -66,10 +68,10 @@ impl Tool {
         let list = cx.new(|cx| ListState::new(Rows { games: Rc::new(Vec::new()) }, window, cx).selectable(false));
         let focus_handle = cx.focus_handle().tab_stop(true);
         window.focus(&focus_handle, cx);
-        Self { shelves: Vec::new(), active: None, chosen: Selection::default(), list, focus_handle, message: "打开或拖入多个 CBL、QYL 棋库".into() }
+        Self { shelves: Vec::new(), active: None, chosen: Selection::default(), list, focus_handle, message: "打开或拖入 CBL、QYL 棋库或 FEN 文本（.txt）".into() }
     }
     fn open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let dialog = rfd::AsyncFileDialog::new().set_parent(window).add_filter("棋库", &["cbl", "qyl"]);
+        let dialog = rfd::AsyncFileDialog::new().set_parent(window).add_filter("棋库与 FEN 文本", &["cbl", "qyl", "txt"]);
         cx.spawn_in(window, async move |this, cx| {
             let files = dialog.pick_files().await;
             this.update_in(cx, |this, window, cx| {
@@ -81,10 +83,39 @@ impl Tool {
     fn drop_files(&mut self, paths: &ExternalPaths, window: &mut Window, cx: &mut Context<Self>) {
         self.add(paths.paths().to_vec(), window, cx);
     }
+    fn open_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let dialog = rfd::AsyncFileDialog::new().set_parent(window).set_title("选择文件夹（自动包含子文件夹）");
+        cx.spawn_in(window, async move |this, cx| {
+            let folder = dialog.pick_folder().await;
+            this.update_in(cx, |this, window, cx| {
+                if let Some(folder) = folder {
+                    let mut paths = Vec::new();
+                    scan_libraries(folder.path(), &mut paths);
+                    if paths.is_empty() {
+                        this.message = format!("{}：没有找到 .cbl / .qyl 棋库", folder.path().display()).into();
+                    } else {
+                        this.add(paths, window, cx);
+                    }
+                }
+                window.focus(&this.focus_handle, cx);
+            }).ok();
+        }).detach();
+    }
     fn add(&mut self, paths: Vec<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
+        let mut files = Vec::new();
+        let mut folders = 0usize;
+        for path in paths {
+            if path.is_dir() {
+                folders += 1;
+                scan_libraries(&path, &mut files);
+            } else {
+                files.push(path);
+            }
+        }
+        let scanned = files.len();
         let mut errors = Vec::new();
         let mut added = 0usize;
-        for path in paths {
+        for path in files {
             if self.shelves.iter().any(|shelf| shelf.path == path) { continue; }
             match load_shelf(&path) {
                 Ok(shelf) => {
@@ -95,7 +126,13 @@ impl Tool {
             }
         }
         if self.active.is_none() && !self.shelves.is_empty() { self.active = Some(0); }
-        errors.insert(0, format!("已加入 {added} 个棋库，共 {} 个", self.shelves.len()));
+        if folders > 0 && scanned == 0 {
+            errors.insert(0, format!("已扫描 {folders} 个文件夹，没有找到 .cbl / .qyl 棋库"));
+        } else if folders > 0 {
+            errors.insert(0, format!("已加入 {added} 个棋库，共 {} 个（扫描 {folders} 个文件夹、{scanned} 个棋库文件）", self.shelves.len()));
+        } else {
+            errors.insert(0, format!("已加入 {added} 个棋库，共 {} 个", self.shelves.len()));
+        }
         self.message = errors.join("\n").into();
         window.focus(&self.focus_handle, cx);
         self.sync(cx);
@@ -143,37 +180,119 @@ impl Tool {
         let indexes = self.chosen.targets(&order);
         if indexes.is_empty() { self.message = "先在左侧选中要转换的棋库".into(); cx.notify(); return; }
         let mut lines = Vec::new();
+        let (mut done, mut skipped, mut failed) = (0usize, 0usize, 0usize);
         for index in indexes {
             let Some(shelf) = self.shelves.get(index) else { continue };
             let name = file_name(&shelf.path);
-            if shelf.kind == target { lines.push(format!("{name}：已经是 {target}，未转换")); continue; }
-            let path = shelf.path.with_extension(target);
-            if path.exists() { lines.push(format!("{name}：转换失败，目标 {} 已存在，未覆盖", file_name(&path))); continue; }
-            let result = if target == "cbl" {
-                cbl::write(&path, &shelf.name, shelf.author.as_deref(), shelf.description.as_deref(), &shelf.games).map(|mut warnings| {
-                    if shelf.created_at != 0 { warnings.push(format!("QYL 创建时间戳 {} 没有 CBL 对应字段", shelf.created_at)); }
-                    warnings
-                })
-            } else { save_qyl(&path, shelf) };
-            match result {
-                Ok(mut warnings) => {
-                    warnings.splice(0..0, shelf.warnings.iter().cloned());
+            match convert_shelf(shelf, target) {
+                ConvertResult::Done(warnings) => {
+                    done += 1;
+                    let path = shelf.path.with_extension(target);
                     lines.push(if warnings.is_empty() { format!("{name}：已转为 {}，内容校验通过", file_name(&path)) } else { format!("{name}：已转为 {}，有兼容性提示", file_name(&path)) });
-                    lines.extend(warnings.into_iter().map(|warning| format!("{name}：注意，{warning}")));
+                    let all: Vec<String> = shelf.warnings.iter().cloned().chain(warnings).collect();
+                    lines.extend(all.into_iter().map(|warning| format!("{name}：注意，{warning}")));
                 }
-                Err(error) => lines.push(format!("{name}：转换失败，{error}")),
+                ConvertResult::Skipped(reason) => { skipped += 1; lines.push(format!("{name}：{reason}")); }
+                ConvertResult::Failed(error) => { failed += 1; lines.push(format!("{name}：转换失败，{error}")); }
             }
         }
+        lines.insert(0, format!("转换完成：成功 {done}，失败 {failed}，跳过 {skipped}"));
         self.message = lines.join("\n").into();
         cx.notify();
     }
+    fn auto_convert(&mut self, cx: &mut Context<Self>) {
+        let order: Vec<usize> = (0..self.shelves.len()).collect();
+        let mut indexes = self.chosen.targets(&order);
+        let whole_list = indexes.is_empty();
+        if whole_list { indexes = order; }
+        if indexes.is_empty() { self.message = "列表为空，请先打开或拖入棋库（可直接拖文件夹）".into(); cx.notify(); return; }
+        let (mut done, mut skipped, mut failed) = (0usize, 0usize, 0usize);
+        let (mut warnings_total, mut new_files) = (0usize, 0usize);
+        let mut lines = Vec::new();
+        for index in indexes {
+            let Some(shelf) = self.shelves.get(index) else { continue };
+            let name = file_name(&shelf.path);
+            let target: &'static str = match shelf.kind {
+                "cbl" => "qyl",
+                "qyl" => "cbl",
+                _ => "qyl",
+            };
+            match convert_shelf(shelf, target) {
+                ConvertResult::Done(warnings) => {
+                    done += 1;
+                    warnings_total += warnings.len();
+                    new_files += 1;
+                    let path = shelf.path.with_extension(target);
+                    lines.push(format!("{name} → {}：成功{}", file_name(&path), if warnings.is_empty() { String::new() } else { format!("（{} 条兼容性提示）", warnings.len()) }));
+                }
+                ConvertResult::Skipped(reason) => { skipped += 1; lines.push(format!("{name}：{reason}")); }
+                ConvertResult::Failed(error) => { failed += 1; lines.push(format!("{name}：转换失败，{error}")); }
+            }
+        }
+        let scope = if whole_list { "全部棋库" } else { "已选棋库" };
+        lines.insert(0, format!("自动双向转换（{scope}）：成功 {done}，失败 {failed}，跳过 {skipped}；新增 {new_files} 个文件，兼容性提示 {warnings_total} 条"));
+        self.message = lines.join("\n").into();
+        self.sync(cx);
+    }
+}
+
+enum ConvertResult { Done(Vec<String>), Skipped(String), Failed(String) }
+
+fn convert_shelf(shelf: &Shelf, target: &'static str) -> ConvertResult {
+    if shelf.kind == target { return ConvertResult::Skipped(format!("已经是 {target}，未转换")); }
+    if shelf.kind == "txt" && target != "qyl" { return ConvertResult::Skipped("FEN 文本只能转为 QYL".into()); }
+    let path = shelf.path.with_extension(target);
+    if path.exists() { return ConvertResult::Skipped(format!("已跳过，目标 {} 已存在，未覆盖", file_name(&path))); }
+    let result = if target == "cbl" {
+        cbl::write(&path, &shelf.name, shelf.author.as_deref(), shelf.description.as_deref(), &shelf.games).map(|mut warnings| {
+            if shelf.created_at != 0 { warnings.push(format!("QYL 创建时间戳 {} 没有 CBL 对应字段", shelf.created_at)); }
+            warnings
+        })
+    } else { save_qyl(&path, shelf) };
+    match result {
+        Ok(warnings) => ConvertResult::Done(warnings),
+        Err(error) => ConvertResult::Failed(error),
+    }
+}
+
+fn is_library(path: &Path) -> bool {
+    match path.extension().and_then(|ext| ext.to_str()).map(|ext| ext.to_ascii_lowercase()).as_deref() {
+        Some("cbl") | Some("qyl") => true,
+        Some("txt") => fen::looks_like_text(path),
+        _ => false,
+    }
+}
+
+fn scan_libraries(dir: &Path, files: &mut Vec<PathBuf>) {
+    let mut seen = HashSet::new();
+    scan_into(dir, files, &mut seen, 0);
+}
+
+fn scan_into(dir: &Path, files: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf>, depth: usize) {
+    if depth > 64 { return; }
+    let Ok(canonical) = dir.canonicalize() else { return };
+    if !seen.insert(canonical) { return; }
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let mut subdirs = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(kind) = entry.file_type() else { continue };
+        if kind.is_dir() || (kind.is_symlink() && path.is_dir()) {
+            subdirs.push(path);
+        } else if kind.is_file() && is_library(&path) {
+            files.push(path);
+        }
+    }
+    subdirs.sort();
+    for subdir in subdirs { scan_into(&subdir, files, seen, depth + 1); }
 }
 
 fn load_shelf(path: &Path) -> Result<Shelf, String> {
     let (kind, name, author, description, created_at, games, ordinals, warnings) = match path.extension().and_then(|ext| ext.to_str()).map(|ext| ext.to_ascii_lowercase()).as_deref() {
         Some("cbl") => { let lib = cbl::read(path)?; ("cbl", lib.name, lib.author, lib.description, 0, lib.games, lib.ordinals, lib.warnings) }
         Some("qyl") => { let lib = Library::load(path)?; ("qyl", lib.name, lib.author, lib.description, lib.created_at, lib.games, vec![], lib.warnings) }
-        _ => return Err("只支持 CBL 和 QYL".into()),
+        Some("txt") => { let lib = fen::read(path)?; ("txt", lib.name, None, None, 0, lib.games, vec![], lib.warnings) }
+        _ => return Err("只支持 CBL、QYL 棋库和 FEN 文本（.txt）".into()),
     };
     Ok(Shelf { path: path.to_path_buf(), name, author, description, created_at, games, ordinals, warnings, kind })
 }
@@ -246,9 +365,11 @@ impl Render for Tool {
                 .child(v_flex().w_64().flex_shrink_0().h_full().min_w_0().p_4().gap_3().bg(cx.theme().sidebar).border_r_1().border_color(cx.theme().border)
                     .child(h_flex().justify_between().items_center().child(div().text_xl().font_semibold().child("棋库")).child(h_flex().gap_2()
                         .child(Button::new("unselect").ghost().compact().disabled(self.chosen.items.is_empty()).label("取消选中").on_click(cx.listener(|this, _, _, cx| this.clear_chosen(cx))))
-                        .child(Button::new("clear").ghost().compact().disabled(self.shelves.is_empty()).label("清空").on_click(cx.listener(|this, _, _, cx| this.clear_all(cx))))
-                        .child(Button::new("open").label("打开").on_click(cx.listener(|this, _, window, cx| this.open(window, cx))))))
-                    .child(div().text_sm().text_color(cx.theme().muted_foreground).child("单击查看，Ctrl＋单击多选，Shift＋单击连选，Ctrl＋A 全选，Esc 取消选中"))
+                        .child(Button::new("clear").ghost().compact().disabled(self.shelves.is_empty()).label("清空").on_click(cx.listener(|this, _, _, cx| this.clear_all(cx))))))
+                    .child(h_flex().gap_2()
+                        .child(Button::new("open").label("打开文件").on_click(cx.listener(|this, _, window, cx| this.open(window, cx))))
+                        .child(Button::new("open-dir").label("打开文件夹").on_click(cx.listener(|this, _, window, cx| this.open_folder(window, cx)))))
+                    .child(div().text_sm().text_color(cx.theme().muted_foreground).child("单击查看，Ctrl＋单击多选，Shift＋单击连选，Ctrl＋A 全选，Esc 取消选中。拖入文件或文件夹均可，文件夹会递归扫描子目录。支持 CBL、QYL 棋库和每行一个 FEN 的 .txt 文本。"))
                     .child(div().id("shelves").flex_1().min_h_0().overflow_y_scrollbar().children(shelves.into_iter().map(|(index, name, kind, games)| {
                         let marked = chosen.contains(&index);
                         let row = div().id(("shelf", index)).test_support().w_full().min_w_0().p_3().mb_2().rounded_md().border_1().border_color(if marked { cx.theme().primary } else { cx.theme().border })
@@ -263,7 +384,7 @@ impl Render for Tool {
                                     window.focus(&this.focus_handle, cx);
                                     this.close(index, cx);
                                 }))))
-                            .child(div().mt_1().text_sm().text_color(cx.theme().muted_foreground).child(format!("{kind} · {games} 局")))
+                            .child(div().mt_1().text_sm().text_color(cx.theme().muted_foreground).child(format!("{kind} · {games} {}", if kind == "txt" { "题" } else { "局" })))
                     }))))
                 .child(v_flex().flex_1().h_full().min_w_0()
                     .child(h_flex().px_4().h_16().flex_shrink_0().items_center().justify_between().gap_3().border_b_1().border_color(cx.theme().border)
@@ -271,8 +392,9 @@ impl Render for Tool {
                             .child(div().flex_shrink_0().text_xl().font_semibold().child("棋谱"))
                             .child(div().min_w_0().text_sm().text_color(cx.theme().muted_foreground).child("转换后的棋库与源文件保存在同一目录")))
                         .child(h_flex().flex_shrink_0().gap_2()
-                            .child(Button::new("to-qyl").primary().disabled(empty).label("转为 QYL").on_click(cx.listener(|this, _, _, cx| this.convert("qyl", cx))))
-                            .child(Button::new("to-cbl").primary().disabled(empty).label("转为 CBL").on_click(cx.listener(|this, _, _, cx| this.convert("cbl", cx))))))
+                            .child(Button::new("auto").primary().disabled(self.shelves.is_empty()).label("自动双向转换").on_click(cx.listener(|this, _, _, cx| this.auto_convert(cx))))
+                            .child(Button::new("to-qyl").ghost().disabled(empty).label("转为 QYL").on_click(cx.listener(|this, _, _, cx| this.convert("qyl", cx))))
+                            .child(Button::new("to-cbl").ghost().disabled(empty).label("转为 CBL").on_click(cx.listener(|this, _, _, cx| this.convert("cbl", cx))))))
                     .child(div().h_9().px_3().flex_shrink_0().flex().items_center().bg(cx.theme().table_head).font_semibold().border_b_1().border_color(cx.theme().border)
                         .child(columns(["序号".into(), "标题".into(), "棋手对阵".into(), "赛事".into(), "日期".into(), "结果".into()])))
                     .child(div().px_3().py_2().flex_shrink_0().max_h_32().overflow_y_scrollbar().text_sm().text_color(cx.theme().muted_foreground).child(format!("当前棋库 {count} 局 · 已选 {} 个棋库\n{message}", chosen.len())))
