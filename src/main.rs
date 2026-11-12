@@ -10,7 +10,7 @@ mod ui_tests;
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::list::{List, ListDelegate, ListItem, ListState};
-use gpui_kit::component::scroll::ScrollableElement as _;
+use gpui_kit::component::scroll::{ScrollableElement as _, Scrollbar};
 use gpui_kit::component::*;
 use gpui_kit::*;
 use qy::{Game, Library};
@@ -38,6 +38,7 @@ struct Tool {
     active: Option<usize>,
     chosen: Selection,
     list: Entity<ListState<Rows>>,
+    shelves_scroll: UniformListScrollHandle,
     focus_handle: FocusHandle,
     message: SharedString,
 }
@@ -68,7 +69,7 @@ impl Tool {
         let list = cx.new(|cx| ListState::new(Rows { games: Rc::new(Vec::new()) }, window, cx).selectable(false));
         let focus_handle = cx.focus_handle().tab_stop(true);
         window.focus(&focus_handle, cx);
-        Self { shelves: Vec::new(), active: None, chosen: Selection::default(), list, focus_handle, message: "打开或拖入 CBL、QYL 棋库或 FEN 文本（.txt）".into() }
+        Self { shelves: Vec::new(), active: None, chosen: Selection::default(), list, shelves_scroll: UniformListScrollHandle::new(), focus_handle, message: "打开或拖入 CBL、QYL 棋库或 FEN 文本（.txt）".into() }
     }
     fn open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let dialog = rfd::AsyncFileDialog::new().set_parent(window).add_filter("棋库与 FEN 文本", &["cbl", "qyl", "txt"]);
@@ -348,13 +349,18 @@ fn configure_theme(cx: &mut App) {
 
 impl Render for Tool {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let shelves = self.shelves.iter().enumerate().map(|(index, shelf)| (index, file_name(&shelf.path), shelf.kind, shelf.games.len())).collect::<Vec<_>>();
+        let shelves = Rc::new(self.shelves.iter().enumerate().map(|(index, shelf)| (index, file_name(&shelf.path), shelf.kind, shelf.games.len())).collect::<Vec<_>>());
         let active = self.active;
-        let chosen = self.chosen.items.clone();
+        let chosen = Rc::new(self.chosen.items.clone());
         let message = self.message.clone();
         let count = active.and_then(|index| self.shelves.get(index)).map(|shelf| shelf.games.len()).unwrap_or(0);
         let list = self.list.clone();
         let empty = chosen.is_empty();
+        let shelves_count = self.shelves.len();
+        let rows_shelves = shelves.clone();
+        let rows_chosen = chosen.clone();
+        let rows_entity = cx.entity();
+        let shelves_scroll = self.shelves_scroll.clone();
         v_flex().size_full().bg(cx.theme().background).text_color(cx.theme().foreground)
             .id("convert").track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::select_all))
@@ -370,22 +376,31 @@ impl Render for Tool {
                         .child(Button::new("open").label("打开文件").on_click(cx.listener(|this, _, window, cx| this.open(window, cx))))
                         .child(Button::new("open-dir").label("打开文件夹").on_click(cx.listener(|this, _, window, cx| this.open_folder(window, cx)))))
                     .child(div().text_sm().text_color(cx.theme().muted_foreground).child("单击查看，Ctrl＋单击多选，Shift＋单击连选，Ctrl＋A 全选，Esc 取消选中。拖入文件或文件夹均可，文件夹会递归扫描子目录。支持 CBL、QYL 棋库和每行一个 FEN 的 .txt 文本。"))
-                    .child(div().id("shelves").flex_1().min_h_0().overflow_y_scrollbar().children(shelves.into_iter().map(|(index, name, kind, games)| {
-                        let marked = chosen.contains(&index);
-                        let row = div().id(("shelf", index)).test_support().w_full().min_w_0().p_3().mb_2().rounded_md().border_1().border_color(if marked { cx.theme().primary } else { cx.theme().border })
-                            .bg(if marked { cx.theme().accent } else if active == Some(index) { cx.theme().sidebar_accent } else { cx.theme().background });
-                        let row = if marked { row } else { row.hover(|row| row.bg(cx.theme().table_head)) };
-                        row
-                            .on_click(cx.listener(move |this, event, window, cx| this.pick(index, event, window, cx)))
-                            .child(h_flex().w_full().items_start().justify_between().gap_2()
-                                .child(div().min_w_0().flex_1().overflow_hidden().whitespace_nowrap().text_ellipsis().child(name))
-                                .child(Button::new(("close", index)).ghost().compact().label("×").on_click(cx.listener(move |this, _, window, cx| {
-                                    cx.stop_propagation();
-                                    window.focus(&this.focus_handle, cx);
-                                    this.close(index, cx);
-                                }))))
-                            .child(div().mt_1().text_sm().text_color(cx.theme().muted_foreground).child(format!("{kind} · {games} {}", if kind == "txt" { "题" } else { "局" })))
-                    }))))
+                    .child(v_flex().relative().flex_1().min_h_0().overflow_hidden()
+                        .child(uniform_list("shelves", shelves_count, move |range, _: &mut Window, cx: &mut App| {
+                            range.filter_map(|index| {
+                                let (_, name, kind, games) = rows_shelves.get(index)?;
+                                let marked = rows_chosen.contains(&index);
+                                let row = div().id(("shelf", index)).test_support().w_full().min_w_0().p_3().rounded_md().border_1().border_color(if marked { cx.theme().primary } else { cx.theme().border })
+                                    .bg(if marked { cx.theme().accent } else if active == Some(index) { cx.theme().sidebar_accent } else { cx.theme().background });
+                                let row = if marked { row } else { row.hover(|row| row.bg(cx.theme().table_head)) };
+                                let mouse_entity = rows_entity.clone();
+                                let close_entity = rows_entity.clone();
+                                Some(div().pb_2().child(row
+                                    .on_click(move |event, window, cx| { mouse_entity.update(cx, |this, cx| this.pick(index, event, window, cx)); })
+                                    .child(h_flex().w_full().items_start().justify_between().gap_2()
+                                        .child(div().min_w_0().flex_1().overflow_hidden().whitespace_nowrap().text_ellipsis().child(name.clone()))
+                                        .child(Button::new(("close", index)).ghost().compact().label("×").on_click(move |_, window, cx| {
+                                            cx.stop_propagation();
+                                            close_entity.update(cx, |this, cx| {
+                                                window.focus(&this.focus_handle, cx);
+                                                this.close(index, cx);
+                                            });
+                                        })))
+                                    .child(div().mt_1().text_sm().text_color(cx.theme().muted_foreground).child(format!("{kind} · {games} {}", if *kind == "txt" { "题" } else { "局" })))))
+                            }).collect::<Vec<_>>()
+                        }).size_full().track_scroll(&self.shelves_scroll))
+                        .child(Scrollbar::vertical(&shelves_scroll))))
                 .child(v_flex().flex_1().h_full().min_w_0()
                     .child(h_flex().px_4().h_16().flex_shrink_0().items_center().justify_between().gap_3().border_b_1().border_color(cx.theme().border)
                         .child(h_flex().flex_1().min_w_0().items_center().gap_3()
